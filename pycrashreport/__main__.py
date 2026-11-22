@@ -10,8 +10,33 @@ from pycrashreport.crash_report import (
     PanicProcess,
     get_crash_report_from_file,
 )
+from pycrashreport.server_symbols import ServerSymbols
 
 app = typer.Typer(add_completion=False)
+
+
+def symbolicate_on_server(server: str, report_path: Path) -> ServerSymbols:
+    """Symbolicate the report stored at ``report_path`` on a symbolicator server."""
+    try:
+        from symbolicator_server.client import SymbolicatorClient
+        from symbolicator_server.exceptions import ServerError, ServerUnreachableError
+    except ImportError:
+        raise typer.BadParameter(
+            "--server requires symbolicator-server: "
+            'python3 -m pip install -U "pycrashreport[server]"'
+        ) from None
+    if not report_path.is_file():
+        raise typer.BadParameter("--server requires the report as a file")
+
+    try:
+        symbolicated = SymbolicatorClient(server).symbolicate(report_path)
+    except ServerUnreachableError as e:
+        raise typer.BadParameter(f"Reaching {e.server} failed: {e.reason}") from e
+    except ServerError as e:
+        raise typer.BadParameter(
+            f"Symbolicating on {server} failed: {e.message}"
+        ) from e
+    return ServerSymbols.from_dict(symbolicated)
 
 
 @app.command()
@@ -30,6 +55,17 @@ def main(
             help="Directory of `ipsw` kernel symbolication signatures (the `kernel` directory of "
             "https://github.com/blacktop/symbolicator), to name the kernel functions of a panic. "
             "Requires --kernelcache and the `ipsw` tool."
+        ),
+    ] = None,
+    server: Annotated[
+        Optional[str],
+        typer.Option(
+            "--server",
+            "-s",
+            envvar="SYMBOLICATOR_SERVER",
+            help="URL of a symbolicator server (https://github.com/netanelc305/symbolicator-server), "
+            "e.g. http://localhost:3993, to name the frames of a panic with in place of the local "
+            "kernelcache and Xcode DeviceSupport.",
         ),
     ] = None,
     process: Annotated[
@@ -54,7 +90,14 @@ def main(
     """
     if kernel_signatures is not None and kernelcache is None:
         raise typer.BadParameter("--kernel-signatures requires --kernelcache")
+    if server is not None and kernelcache is not None:
+        raise typer.BadParameter("--server names the kernel frames, drop --kernelcache")
     report = get_crash_report_from_file(file)
+    if server is not None:
+        # the server holds the symbols, the host's are not looked up
+        report.device_support_symbols = None
+        if isinstance(report, KernelModeCrashReport):
+            report.server_symbols = symbolicate_on_server(server, Path(file.name))
     if kernelcache is not None and isinstance(report, KernelModeCrashReport):
         try:
             report.kernel_symbols = KernelSymbols.load(kernelcache, kernel_signatures)

@@ -27,6 +27,8 @@ dynamic = ["dependencies", "version"]
 
 [project.optional-dependencies]
 test = ["pytest"]
+# symbolicating on a symbolicator server (--server), which needs Python 3.14
+server = ["symbolicator-server; python_version >= '3.14'"]
 
 [project.urls]
 "Homepage" = "https://github.com/doronz88/pycrashreport"

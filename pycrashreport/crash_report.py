@@ -20,6 +20,7 @@ from rich.console import Console
 from rich.text import Text
 
 from pycrashreport.exit_reason import ExitReason
+from pycrashreport.server_symbols import ServerFrame, ServerSymbols
 
 Frame = namedtuple("Frame", "image_name image_base image_offset symbol symbol_offset")
 Register = namedtuple("Register", "name value")
@@ -688,6 +689,10 @@ class KernelModeCrashReport(CrashReportBase):
     #: before reading any frames.
     kernel_symbols: Optional[KernelSymbols] = None
 
+    #: Symbols of a symbolicator server, naming every frame in place of the kernel and
+    #: DeviceSupport symbols. Assign them before reading any frames.
+    server_symbols: Optional[ServerSymbols] = None
+
     def _report_field(self, name: str) -> Optional[str]:
         if self._is_json and isinstance(self._data, dict):
             return self._data.get(name)
@@ -764,19 +769,50 @@ class KernelModeCrashReport(CrashReportBase):
             frame.symbol, frame.symbol_offset = symbol
         return frame
 
-    def _frames(self, thread: Mapping[str, Any]) -> List[PanicFrame]:
+    def _server_frame(
+        self, uuid: str, base: int, kind: str, offset: int, server_frame: ServerFrame
+    ) -> PanicFrame:
+        frame = PanicFrame(address=base + offset, image=uuid, image_offset=offset)
+        if kind in IMAGE_KINDS_KERNEL:
+            frame.kernel = True
+            frame.image = self._reported_kernel_images.get(uuid.lower(), uuid)
+        if server_frame.image is not None:
+            frame.image = posixpath.basename(server_frame.image)
+        if server_frame.symbol is not None:
+            frame.symbol = server_frame.symbol
+            frame.symbol_offset = server_frame.offset
+        return frame
+
+    def _frames(
+        self, pid: int, tid: int, thread: Mapping[str, Any]
+    ) -> List[PanicFrame]:
         images = self._report_field("binaryImages") or []
         frames: List[PanicFrame] = []
         for key in ("kernelFrames", "userFrames"):
+            raw_frames = []
             for index, offset in thread.get(key) or []:
+                # address 0: the end of a stack, or one which was not captured
+                if 0 <= index < len(images) and not offset:
+                    if images[index][2] == IMAGE_KIND_ABSOLUTE:
+                        continue
+                raw_frames.append((index, offset))
+            server_frames = [ServerFrame()] * len(raw_frames)
+            if self.server_symbols is not None:
+                server_frames = self.server_symbols.thread_frames(
+                    pid, tid, key, len(raw_frames)
+                )
+            for (index, offset), server_frame in zip(raw_frames, server_frames):
                 if not 0 <= index < len(images):
                     continue
                 uuid, base, kind = images[index][:3]
                 if kind == IMAGE_KIND_ABSOLUTE:
-                    if offset:
-                        frames.append(
-                            PanicFrame(address=offset, kernel=key == "kernelFrames")
-                        )
+                    frames.append(
+                        PanicFrame(address=offset, kernel=key == "kernelFrames")
+                    )
+                elif self.server_symbols is not None:
+                    frames.append(
+                        self._server_frame(uuid, base, kind, offset, server_frame)
+                    )
                 elif kind in IMAGE_KINDS_KERNEL:
                     frames.append(self._kernel_frame(uuid, base, offset, not frames))
                 else:
@@ -794,11 +830,13 @@ class KernelModeCrashReport(CrashReportBase):
                 pid=int(pid), name=process.get("procname") or ""
             )
             for tid, thread in (process.get("threadById") or {}).items():
+                # the server takes the thread's own id over its key, as the device does
+                server_tid = int(thread.get("id", tid))
                 panic_process.threads.append(
                     PanicThread(
                         tid=int(tid),
                         name=thread.get("name"),
-                        frames=self._frames(thread),
+                        frames=self._frames(int(pid), server_tid, thread),
                     )
                 )
             result.append(panic_process)
@@ -1069,6 +1107,14 @@ class KernelModeCrashReport(CrashReportBase):
     def _render_missing_symbols(self, text: Text) -> None:
         """Say which symbols would name the frames left unnamed."""
         frames = self.panicked_thread_frames
+        if self.server_symbols is not None:
+            if self.server_symbols.missing_images:
+                text.append(
+                    f"\tThe symbolicator server holds no symbols for "
+                    f"{len(self.server_symbols.missing_images)} images of the report.\n",
+                    style=STYLE_IDENTIFIER,
+                )
+            return
         if any(frame.kernel for frame in frames):
             if self.kernel_symbols is None:
                 text.append(
